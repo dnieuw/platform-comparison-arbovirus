@@ -1,0 +1,158 @@
+import pandas as pd
+
+samples = pd.read_table("input_config.tsv")
+
+rule all:
+    input:
+        readstats_raw=list("readstats/"+samples["barcode"]+"_"+samples["approach"]+"_"+samples["platform"]+"_raw.tsv"),
+        readstats_qc=list("readstats/"+samples["barcode"]+"_"+samples["approach"]+"_"+samples["platform"]+"_QC.tsv"),
+        readstats_mapped=list("readstats/"+samples["barcode"]+"_"+samples["approach"]+"_"+samples["platform"]+"_"+samples["ref"]+"_mapped.tsv"),
+        coverage_depth=list("depth/"+samples["barcode"]+"_"+samples["approach"]+"_"+samples["platform"]+"_"+samples["ref"]+".tsv")
+
+rule QC_Illumina_reads:
+    input:
+        R1="raw_data/{barcode}_{approach}_{platform}_R1.fastq.gz",
+        R2="raw_data/{barcode}_{approach}_{platform}_R2.fastq.gz"
+    output:
+        R1="QC/{barcode,[A-Za-z0-9]+}_{approach,[A-Za-z]+}_{platform,[A-Za-z]+}_R1.fastq.gz",
+        R2="QC/{barcode,[A-Za-z0-9]+}_{approach,[A-Za-z]+}_{platform,[A-Za-z]+}_R2.fastq.gz",
+        S="QC/{barcode,[A-Za-z0-9]+}_{approach,[A-Za-z]+}_{platform,[A-Za-z]+}_S.fastq.gz",
+        report="QC/{barcode,[A-Za-z0-9]+}_{approach,[A-Za-z]+}_{platform,[A-Za-z]+}.html"
+    threads: 2
+    shell:
+        """
+        fastp --in1 {input.R1} --in2 {input.R2} --out1 {output.R1} --out2 {output.R2} --unpaired1 {output.S} --unpaired2 {output.S} -j /dev/null -h {output.report} --disable_trim_poly_g --detect_adapter_for_pe --cut_tail --cut_tail_window_size 4 --cut_tail_mean_quality 20 --length_required 150 -w {threads}
+        """
+
+rule QC_Nanopore_reads:
+    input:
+        "raw_data/{barcode}_{approach}_{platform}.fastq"
+    output:
+        fastq="QC/{barcode,[A-Za-z0-9]+}_{approach,[A-Za-z]+}_{platform,[A-Za-z]+}.fastq",
+        report="QC/{barcode,[A-Za-z0-9]+}_{approach,[A-Za-z]+}_{platform,[A-Za-z]+}.html"
+    threads: 2
+    shell:
+        """
+        fastp -i {input} -o {output.fastq} -j /dev/null -h {output.report} --disable_trim_poly_g --disable_adapter_trimming --qualified_quality_phred 10 --unqualified_percent_limit 50 --length_required 150 -w {threads}
+        """
+
+rule remove_primers:
+    input:
+        "QC/{barcode}_{approach}_{platform}.fastq"
+    output:
+        "trimmed/{barcode,[A-Za-z0-9]+}_{approach,[A-Za-z]+}_{platform,[A-Za-z]+}.fastq"
+    threads: 4
+    shell:
+        """
+        #Only trim start and end of Nanopore amplicon reads to remove primers
+        if [ {wildcards.approach} = "Amplicon" ] && [ {wildcards.platform} = "Nanopore"]; then
+            cutadapt -u 30 -u -30 -o {output} {input} -m 150 -j {threads} --quiet
+        else
+            ln -sr {input} {output}
+        fi
+        """
+
+rule map_reads_Nanopore:
+    input:
+        trimmed_fastq="trimmed/{barcode}_{approach}_{platform}.fastq",
+        reference="{reference}.fasta"
+    output:
+        bam="mapped/{barcode,[A-Za-z0-9]+}_{approach,[A-Za-z]+}_{platform,[A-Za-z]+}_{reference,[A-Za-z]+}.bam",
+        mapped="mapped/{barcode,[A-Za-z0-9]+}_{approach,[A-Za-z]+}_{platform,[A-Za-z]+}_{reference,[A-Za-z]+}.fastq"
+    threads: 8
+    shell:
+        """
+        minimap2 -Y -t {threads} -x map-ont -a {input.reference} {input.trimmed_fastq} 2> /dev/null | samtools view -bF 4 - | samtools sort -@ {threads} - > {output.bam}
+        samtools index -@ {threads} {output.bam}
+        samtools fastq {output.bam} 2> /dev/null > {output.mapped}
+        """
+
+rule map_reads_Illumina:
+    input:
+        R1="QC/{barcode}_{approach}_{platform}_R1.fastq.gz",
+        R2="QC/{barcode}_{approach}_{platform}_R2.fastq.gz",
+        S="QC/{barcode}_{approach}_{platform}_S.fastq.gz",
+        reference="{reference}.fasta"
+    output:
+        bam="mapped/{barcode,[A-Za-z0-9]+}_{approach,[A-Za-z]+}_{platform,[A-Za-z]+}_{reference,[A-Za-z]+}.bam",
+        mapped="mapped/{barcode,[A-Za-z0-9]+}_{approach,[A-Za-z]+}_{platform,[A-Za-z]+}_{reference,[A-Za-z]+}.fastq"
+    threads: 8
+    shell:
+        """
+        bwa index {input.reference}
+        bwa mem -t {threads} {input.reference} {input.R1} {input.R2} | samtools view -bF 4 - | samtools sort - > {wildcards.barcode}_{wildcards.approach}_{wildcards.platform}_tmp_paired.bam
+        bwa mem -t {threads} {input.reference} {input.S} | samtools view -bF 4 - | samtools sort - > {wildcards.barcode}_{wildcards.approach}_{wildcards.platform}_tmp_singlets.bam
+        samtools merge {output.bam} {wildcards.barcode}_{wildcards.approach}_{wildcards.platform}_tmp_paired.bam {wildcards.barcode}_{wildcards.approach}_{wildcards.platform}_tmp_singlets.bam
+        rm {wildcards.barcode}_{wildcards.approach}_{wildcards.platform}_tmp_paired.bam {wildcards.barcode}_{wildcards.approach}_{wildcards.platform}_tmp_singlets.bam
+        samtools index -@ {threads} {output.bam}
+        samtools fastq {output.bam} 2> /dev/null > {output.mapped}
+        """
+
+rule create_depthfile:
+    input:
+        "mapped/{barcode}_{approach}_{platform}_{reference}.bam"
+    output:
+        "depth/{barcode,[A-Za-z0-9]+}_{approach,[A-Za-z]+}_{platform,[A-Za-z]+}_{reference,[A-Za-z]+}.tsv"
+    threads: 1
+    shell:
+        """
+        samtools depth -a -d 0 {input} > {output}
+        """
+
+rule generate_readstats_raw_Illumina:
+    input: 
+        R1="raw_data/{barcode}_{approach}_{platform}_R1.fastq.gz",
+        R2="raw_data/{barcode}_{approach}_{platform}_R2.fastq.gz"
+    output:
+        "readstats/{barcode}_{approach}_{platform}_raw.tsv"
+    threads: 1
+    shell:
+        """
+        seqkit stats {input.R1} {input.R2} > {output}
+        """
+
+rule generate_readstats_raw_Nanopore:
+    input:
+        "raw_data/{barcode}_{approach}_{platform}.fastq"
+    output:
+        "readstats/{barcode}_{approach}_{platform}_raw.tsv"
+    threads: 1
+    shell:
+        """
+        seqkit stats {input} > {output}
+        """ 
+
+rule generate_readstats_QC_Illumina:
+    input: 
+        R1="QC/{barcode}_{approach}_{platform}_R1.fastq.gz",
+        R2="QC/{barcode}_{approach}_{platform}_R2.fastq.gz",
+        S="QC/{barcode}_{approach}_{platform}_S.fastq.gz"
+    output:
+        "readstats/{barcode}_{approach}_{platform}_QC.tsv"
+    threads: 1
+    shell:
+        """
+        seqkit stats {input.R1} {input.R2} {input.S} > {output}
+        """
+
+rule generate_readstats_QC_Nanopore:
+    input:
+        "QC/{barcode}_{approach}_{platform}.fastq"
+    output:
+        "readstats/{barcode}_{approach}_{platform}_QC.tsv"
+    threads: 1
+    shell:
+        """
+        seqkit stats {input} > {output}
+        """
+
+rule generate_readstats_mapped:
+    input:
+        "mapped/{barcode}_{approach}_{platform}_{reference}.fastq"
+    output:
+        "readstats/{barcode}_{approach}_{platform}_{reference}_mapped.tsv"
+    threads: 1
+    shell:
+        """
+        seqkit stats {input} > {output}
+        """
