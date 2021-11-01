@@ -7,7 +7,11 @@ rule all:
         readstats_raw=list("readstats/"+samples["barcode"]+"_"+samples["approach"]+"_"+samples["platform"]+"_raw.tsv"),
         readstats_qc=list("readstats/"+samples["barcode"]+"_"+samples["approach"]+"_"+samples["platform"]+"_QC.tsv"),
         readstats_mapped=list("readstats/"+samples["barcode"]+"_"+samples["approach"]+"_"+samples["platform"]+"_"+samples["ref"]+"_mapped.tsv"),
-        coverage_depth=list("depth/"+samples["barcode"]+"_"+samples["approach"]+"_"+samples["platform"]+"_"+samples["ref"]+".tsv")
+        readstats_mapped_cleaned=list("readstats/"+samples["barcode"]+"_"+samples["approach"]+"_"+samples["platform"]+"_"+samples["ref"]+"_mapped_cleaned.tsv"),
+        coverage_depth=list("depth/"+samples["barcode"]+"_"+samples["approach"]+"_"+samples["platform"]+"_"+samples["ref"]+".tsv"),
+        coverage_depth_cleaned=list("depth/"+samples["barcode"]+"_"+samples["approach"]+"_"+samples["platform"]+"_"+samples["ref"]+"_cleaned.tsv"),
+        variant_files=list("vcf/"+samples["barcode"]+"_"+samples["approach"]+"_"+samples["platform"]+"_"+samples["ref"]+".tsv"),
+        variant_files_cleaned=list("vcf/"+samples["barcode"]+"_"+samples["approach"]+"_"+samples["platform"]+"_"+samples["ref"]+"_cleaned.tsv")
 
 rule QC_Illumina_reads:
     input:
@@ -36,35 +40,17 @@ rule QC_Nanopore_reads:
         fastp -i {input} -o {output.fastq} -j /dev/null -h {output.report} --disable_trim_poly_g --disable_adapter_trimming --qualified_quality_phred 10 --unqualified_percent_limit 50 --length_required 150 -w {threads}
         """
 
-rule remove_primers:
-    input:
-        "QC/{barcode}_{approach}_{platform}.fastq"
-    output:
-        "trimmed/{barcode,[A-Za-z0-9]+}_{approach,[A-Za-z]+}_{platform,[A-Za-z]+}.fastq"
-    threads: 4
-    shell:
-        """
-        #Only trim start and end of Nanopore amplicon reads to remove primers
-        if [ {wildcards.approach} = "Amplicon" ] && [ {wildcards.platform} = "Nanopore"]; then
-            cutadapt -u 30 -u -30 -o {output} {input} -m 150 -j {threads} --quiet
-        else
-            ln -sr {input} {output}
-        fi
-        """
-
 rule map_reads_Nanopore:
     input:
-        trimmed_fastq="trimmed/{barcode}_{approach}_{platform}.fastq",
+        fastq="QC/{barcode}_{approach}_{platform}.fastq",
         reference="{reference}.fasta"
     output:
-        bam="mapped/{barcode,[A-Za-z0-9]+}_{approach,[A-Za-z]+}_{platform,[A-Za-z]+}_{reference,[A-Za-z]+}.bam",
-        mapped="mapped/{barcode,[A-Za-z0-9]+}_{approach,[A-Za-z]+}_{platform,[A-Za-z]+}_{reference,[A-Za-z]+}.fastq"
+        bam="mapped/{barcode,[A-Za-z0-9]+}_{approach,[A-Za-z]+}_{platform,[A-Za-z]+}_{reference,[A-Za-z]+}.bam"
     threads: 8
     shell:
         """
-        minimap2 -Y -t {threads} -x map-ont -a {input.reference} {input.trimmed_fastq} 2> /dev/null | samtools view -bF 4 - | samtools sort -@ {threads} - > {output.bam}
+        minimap2 -Y -t {threads} -x map-ont -a {input.reference} {input.fastq} 2> /dev/null | samtools view -bF 4 - | samtools sort -@ {threads} - > {output.bam}
         samtools index -@ {threads} {output.bam}
-        samtools fastq {output.bam} 2> /dev/null > {output.mapped}
         """
 
 rule map_reads_Illumina:
@@ -74,18 +60,117 @@ rule map_reads_Illumina:
         S="QC/{barcode}_{approach}_{platform}_S.fastq.gz",
         reference="{reference}.fasta"
     output:
-        bam="mapped/{barcode,[A-Za-z0-9]+}_{approach,[A-Za-z]+}_{platform,[A-Za-z]+}_{reference,[A-Za-z]+}.bam",
-        mapped="mapped/{barcode,[A-Za-z0-9]+}_{approach,[A-Za-z]+}_{platform,[A-Za-z]+}_{reference,[A-Za-z]+}.fastq"
+        bam="mapped/{barcode,[A-Za-z0-9]+}_{approach,[A-Za-z]+}_{platform,[A-Za-z]+}_{reference,[A-Za-z]+}.bam"
     threads: 8
     shell:
         """
-        bwa index {input.reference}
-        bwa mem -t {threads} {input.reference} {input.R1} {input.R2} | samtools view -bF 4 - | samtools sort - > {wildcards.barcode}_{wildcards.approach}_{wildcards.platform}_tmp_paired.bam
-        bwa mem -t {threads} {input.reference} {input.S} | samtools view -bF 4 - | samtools sort - > {wildcards.barcode}_{wildcards.approach}_{wildcards.platform}_tmp_singlets.bam
-        samtools merge {output.bam} {wildcards.barcode}_{wildcards.approach}_{wildcards.platform}_tmp_paired.bam {wildcards.barcode}_{wildcards.approach}_{wildcards.platform}_tmp_singlets.bam
+        bwa mem -Y -t {threads} {input.reference} {input.R1} {input.R2} | samtools view -bF 4 - | samtools sort - > {wildcards.barcode}_{wildcards.approach}_{wildcards.platform}_tmp_paired.bam
+        bwa mem -Y -t {threads} {input.reference} {input.S} | samtools view -bF 4 - | samtools sort - > {wildcards.barcode}_{wildcards.approach}_{wildcards.platform}_tmp_singlets.bam
+        samtools merge -f {output.bam} {wildcards.barcode}_{wildcards.approach}_{wildcards.platform}_tmp_paired.bam {wildcards.barcode}_{wildcards.approach}_{wildcards.platform}_tmp_singlets.bam
         rm {wildcards.barcode}_{wildcards.approach}_{wildcards.platform}_tmp_paired.bam {wildcards.barcode}_{wildcards.approach}_{wildcards.platform}_tmp_singlets.bam
         samtools index -@ {threads} {output.bam}
-        samtools fastq {output.bam} 2> /dev/null > {output.mapped}
+        """
+
+rule dedup_alignment:
+    input:
+        "mapped/{barcode}_{approach}_{platform}_{reference}.bam"
+    output:
+        "mapped/{barcode,[A-Za-z0-9]+}_{approach,[A-Za-z]+}_{platform,[A-Za-z]+}_{reference,[A-Za-z]+}_dedup.bam"
+    threads:
+        1
+    shell:
+        """
+        #Only deduplicate non-amplicon based approaches
+        if [ "{wildcards.approach}" = "Amplicon" ]; then
+            ln -sr {input} {output}
+        else
+            sambamba markdup -t {threads} -r {input} {output}
+        fi
+        samtools index -@ {threads} {output}
+        """
+
+rule clip_primers:
+    input:
+        bam="mapped/{barcode}_{approach}_{platform}_{reference}_dedup.bam",
+        bedfile="Primers_{reference}.bed"
+    output:
+        "mapped/{barcode,[A-Za-z0-9]+}_{approach,[A-Za-z]+}_{platform,[A-Za-z]+}_{reference,[A-Za-z]+}_clipped.bam"
+    threads:
+        1
+    shell:
+        """
+        #Only trim primers if approach is amplicon
+        if [ "{wildcards.approach}" = "Amplicon" ]; then
+            ampliclip.py -i {input.bam} -o {input.bam}_tmp -b {input.bedfile} -p 25
+            samtools sort {input.bam}_tmp > {output}
+        else
+            ln -sr {input.bam} {output}
+        fi
+        samtools index -@ {threads} {output}
+        """
+
+rule clean_alignment:
+    input:
+        "mapped/{barcode}_{approach}_{platform}_{reference}_clipped.bam"
+    output:
+        "mapped/{barcode,[A-Za-z0-9]+}_{approach,[A-Za-z]+}_{platform,[A-Za-z]+}_{reference,[A-Za-z]+}_cleaned.bam",
+    threads:
+        1
+    shell:
+        """
+        #Only for Illumina, remove reads with more than 10% softclipped bases
+        if [ "{wildcards.platform}" = "Illumina" ]; then
+            rmsoftclipped.py -f 0.1 -i {input} -o {output}
+        else
+            ln -sr {input} {output}
+        fi
+        samtools index -@ {threads} {output}
+        """
+
+rule create_vcffile:
+    input:
+        bamfile="mapped/{barcode}_{approach}_{platform}_{reference}.bam",
+        reference="{reference}.fasta"
+    output:
+        "vcf/{barcode,[A-Za-z0-9]+}_{approach,[A-Za-z]+}_{platform,[A-Za-z]+}_{reference,[A-Za-z]+}.vcf"
+    threads: 4
+    shell:
+        """
+        bam2vcf.py -d 0 -af 0.01 -c {threads} -b {input.bamfile} -o {output} -r {input.reference}
+        """
+
+rule create_vcf_tsvfile:
+    input:
+        "vcf/{barcode}_{approach}_{platform}_{reference}.vcf"
+    output:
+        "vcf/{barcode,[A-Za-z0-9]+}_{approach,[A-Za-z]+}_{platform,[A-Za-z]+}_{reference,[A-Za-z]+}.tsv"
+    threads: 1
+    shell:
+        """
+        vcf2tsv.py --i {input} -o {output}
+        """
+
+rule create_vcffile_cleaned:
+    input:
+        bamfile="mapped/{barcode}_{approach}_{platform}_{reference}_cleaned.bam",
+        reference="{reference}.fasta"
+    output:
+        "vcf/{barcode,[A-Za-z0-9]+}_{approach,[A-Za-z]+}_{platform,[A-Za-z]+}_{reference,[A-Za-z]+}_cleaned.vcf"
+    threads: 4
+    shell:
+        """
+        bam2vcf.py -d 0 -af 0.01 -c {threads} -b {input.bamfile} -o {output} -r {input.reference}
+        """
+
+rule create_vcf_tsvfile_cleaned:
+    input:
+        "vcf/{barcode}_{approach}_{platform}_{reference}_cleaned.vcf"
+    output:
+        "vcf/{barcode,[A-Za-z0-9]+}_{approach,[A-Za-z]+}_{platform,[A-Za-z]+}_{reference,[A-Za-z]+}_cleaned.tsv"
+    threads: 1
+    shell:
+        """
+        vcf2tsv.py --i {input} -o {output}
         """
 
 rule create_depthfile:
@@ -93,6 +178,17 @@ rule create_depthfile:
         "mapped/{barcode}_{approach}_{platform}_{reference}.bam"
     output:
         "depth/{barcode,[A-Za-z0-9]+}_{approach,[A-Za-z]+}_{platform,[A-Za-z]+}_{reference,[A-Za-z]+}.tsv"
+    threads: 1
+    shell:
+        """
+        samtools depth -a -d 0 {input} > {output}
+        """
+
+rule create_depthfile_cleaned:
+    input:
+        "mapped/{barcode}_{approach}_{platform}_{reference}_cleaned.bam"
+    output:
+        "depth/{barcode,[A-Za-z0-9]+}_{approach,[A-Za-z]+}_{platform,[A-Za-z]+}_{reference,[A-Za-z]+}_cleaned.tsv"
     threads: 1
     shell:
         """
@@ -148,11 +244,22 @@ rule generate_readstats_QC_Nanopore:
 
 rule generate_readstats_mapped:
     input:
-        "mapped/{barcode}_{approach}_{platform}_{reference}.fastq"
+        "mapped/{barcode}_{approach}_{platform}_{reference}.bam"
     output:
         "readstats/{barcode}_{approach}_{platform}_{reference}_mapped.tsv"
     threads: 1
     shell:
         """
-        seqkit stats {input} > {output}
+        samtools fastq {input} 2> /dev/null | seqkit stats > {output}
+        """
+
+rule generate_readstats_mapped_cleaned:
+    input:
+        "mapped/{barcode}_{approach}_{platform}_{reference}_cleaned.bam"
+    output:
+        "readstats/{barcode}_{approach}_{platform}_{reference}_mapped_cleaned.tsv"
+    threads: 1
+    shell:
+        """
+        samtools fastq {input} 2> /dev/null | seqkit stats > {output}
         """
